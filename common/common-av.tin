@@ -18,7 +18,7 @@
         (av-duration fmt (av-audio-stream-idx fmt)) )
 
 (defun av-audio-buf-duration (fmt raw)
-        (/ (length raw) 2 (av-audio-channels fmt) (av-audio-sample-rate fmt)) )
+        (/ (length raw) (av-audio-out-channels fmt) (/ (av-audio-out-bps fmt) 8) (av-audio-out-sample-rate fmt)) )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

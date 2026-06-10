@@ -138,6 +138,7 @@
                                 (if tocheck
                                 then    (for j in i do
                                                 (or (in j 'a' .. 'z')
+                                                    (= j '_')
                                                     (and (> (for-pos) 0) (or (in j [ ':' '-' ]) (in j '0' .. '9'))) )))
                                 (if (xml-debug)
                                 then    (print (tile (* 2 (length st))) "OPEN TAG: #" i "#" nl) )
