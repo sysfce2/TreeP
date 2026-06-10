@@ -20,7 +20,6 @@
 #include "../trppix/trppix_internal.h"
 #include "./trpavcodec.h"
 #include <libavutil/imgutils.h>
-#include <libswresample/swresample.h>
 
 #if 1
 #define TRP_AV_LOCK(fmtctx) if(((trp_avcodec_video_t *)(fmtctx))->accel)pthread_mutex_lock(&_trp_av_mutex)
@@ -40,8 +39,6 @@
 #define PRINT_BUF(fmtctx)
 #endif
 
-#define TRP_AV_FILTERS_ENABLED
-
 typedef struct {
     AVFrame *frame;
     uns32b   fmin;
@@ -51,11 +48,9 @@ typedef struct {
 } trp_avcodec_buf_t;
 
 typedef struct {
-#ifdef TRP_AV_FILTERS_ENABLED
     AVFilterContext      *buffersink_ctx;
     AVFilterContext      *buffersrc_ctx;
     AVFilterGraph        *filter_graph;
-#endif
     trp_obj_t            *descr;
 } trp_avcodec_filter_t;
 
@@ -123,16 +118,25 @@ typedef struct {
     uns8b sottotipo;
     AVFormatContext      *fmt_ctx;
     AVCodecContext       *avctx;
-    SwrContext           *swr_ctx;
     AVPacket             *packet;
-    AVFrame              *frame;
+    AVFrame              *in_frame;
+    AVFrame              *out_frame;
+    AVFilterGraph        *graph;
+    AVFilterContext      *in;
+    AVFilterContext      *out;
     trp_obj_t            *path;
     trp_obj_t            *audio_time_base;
-    uns8b               **buf;
+    trp_obj_t            *tempo;
+    trp_obj_t            *pitch;
     uns8b                *last_error_fun;
     int                   last_error;
-    int                   buf_max_nsamples;
     int                   audio_stream_idx;
+    AVChannelLayout       in_ch_layout;
+    AVChannelLayout       out_ch_layout;
+    enum AVSampleFormat   in_sample_format;
+    enum AVSampleFormat   out_sample_format;
+    int                   in_sample_rate;
+    int                   out_sample_rate;
     uns8b                 ignore_invalid_data;
 } trp_avcodec_audio_t;
 
@@ -197,6 +201,7 @@ static AVFormatContext *trp_av_extract_fmt_context_audio( trp_avcodec_audio_t *f
 static AVFormatContext *trp_av_extract_fmt_context_subtitle( trp_avcodec_subtitle_t *fmtctx );
 static AVFormatContext *trp_av_extract_fmt_context( trp_avcodec_t *fmtctx );
 static struct SwsContext *trp_av_extract_sws_context( trp_avcodec_sws_t *swsctx );
+static AVFilterContext *trp_avfilter_graph_alloc_filter( AVFilterGraph *graph, const char *fltname, const char *name );
 
 static trp_obj_t *trp_av_rational( struct AVRational *r );
 static trp_obj_t *trp_av_ts_sig64_to_trp( trp_avcodec_t *fmtctx, sig64b ts );
@@ -222,6 +227,16 @@ static trp_obj_t *trp_av_avformat_open_input_low( uns8b flags, trp_obj_t *path, 
 static void trp_av_read_frame_free( AVFrame *frameo, AVFrame *filt_rows, AVFrame *filt0_frame, AVFrame *filt1_frame );
 static trp_obj_t *trp_av_metadata_low( AVDictionary *metadata );
 
+static int trp_audio_set_parameters( trp_avcodec_audio_t *av,
+                                     AVChannelLayout *in_ch_layout,
+                                     enum AVSampleFormat in_sample_format,
+                                     int in_sample_rate,
+                                     AVChannelLayout *out_ch_layout,
+                                     enum AVSampleFormat out_sample_format,
+                                     int out_sample_rate,
+                                     trp_obj_t *tempo,
+                                     trp_obj_t *pitch );
+static int trp_av_audio_init_filter_graph( trp_avcodec_audio_t *av );
 static uns8b trp_av_read_frame_no_seek_audio( trp_avcodec_audio_t *fmtctx );
 
 static uns8b trp_av_read_frame_no_seek_subtitle( trp_avcodec_subtitle_t *fmtctx );
@@ -341,15 +356,14 @@ static uns8b trp_av_close_basic( uns8b flags, trp_avcodec_t *obj )
 
                     avformat_close_input( &o->fmt_ctx );
                     avcodec_free_context( &o->avctx );
-                    swr_free( &o->swr_ctx );
                     av_packet_free( &o->packet );
-                    av_frame_free( &o->frame );
-                    if ( o->buf ) {
-                        av_freep( &o->buf[ 0 ] );
-                        av_freep( &o->buf );
-                    }
+                    av_frame_free( &o->in_frame );
+                    av_frame_free( &o->out_frame );
+                    avfilter_graph_free( &o->graph );
                     o->path = NULL;
                     o->audio_time_base = NULL;
+                    o->tempo = NULL;
+                    o->pitch = NULL;
                 }
                 break;
             case TRP_AVCODEC_SUBTL:
@@ -378,12 +392,10 @@ static void trp_av_finalize( void *obj, void *data )
 
 static void trp_av_close_filter( trp_avcodec_video_t *fmtctx )
 {
-#ifdef TRP_AV_FILTERS_ENABLED
     if ( fmtctx->filter ) {
         avfilter_graph_free( &fmtctx->filter->filter_graph );
         fmtctx->filter = NULL;
     }
-#endif
 }
 
 static trp_obj_t *trp_av_width( trp_avcodec_video_t *obj )
@@ -586,6 +598,15 @@ static struct SwsContext *trp_av_extract_sws_context( trp_avcodec_sws_t *swsctx 
         if ( swsctx->sottotipo == TRP_AVCODEC_SCALE )
             return swsctx->sws_ctx;
     return NULL;
+}
+
+static AVFilterContext *trp_avfilter_graph_alloc_filter( AVFilterGraph *graph, const char *fltname, const char *name )
+{
+    const AVFilter *filter = avfilter_get_by_name( fltname );
+
+    if ( filter == NULL )
+        return NULL;
+    return avfilter_graph_alloc_filter( graph, filter, name );
 }
 
 /*************************************************************************************
@@ -1442,7 +1463,6 @@ uns8b trp_av_read_frame( trp_obj_t *fmtctx, trp_obj_t *pix, trp_obj_t *frameno )
         frame = filt_rows;
     }
 
-#ifdef TRP_AV_FILTERS_ENABLED
     if ( ((trp_avcodec_video_t *)fmtctx)->filter ) {
         if ( ( filt0_frame = av_frame_alloc() ) &&
              ( filt1_frame = av_frame_alloc() ) ) {
@@ -1463,7 +1483,6 @@ uns8b trp_av_read_frame( trp_obj_t *fmtctx, trp_obj_t *pix, trp_obj_t *frameno )
             }
         }
     }
-#endif
 
     wo = ((trp_pix_t *)pix)->w;
     ho = ((trp_pix_t *)pix)->h;
@@ -2170,10 +2189,8 @@ uns8b trp_av_set_filter_rows( trp_obj_t *fmtctx, trp_obj_t *mode )
 
 uns8b trp_av_set_filter( trp_obj_t *fmtctx, trp_obj_t *descr )
 {
-#ifdef TRP_AV_FILTERS_ENABLED
     char args[ 512 ];
     const AVFilter *buffersrc  = avfilter_get_by_name( "buffer" );
-    const AVFilter *buffersink = avfilter_get_by_name( "buffersink" );
     AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_video( (trp_avcodec_video_t *)fmtctx );
     AVCodecContext *dec_ctx;
     trp_avcodec_filter_t *filter;
@@ -2211,7 +2228,7 @@ uns8b trp_av_set_filter( trp_obj_t *fmtctx, trp_obj_t *descr )
         goto fail;
 
     /* buffer video sink: to terminate the filter chain. */
-    if ( ( buffersink_ctx = avfilter_graph_alloc_filter(filter_graph, buffersink, "out") ) == NULL )
+    if ( ( buffersink_ctx = trp_avfilter_graph_alloc_filter(filter_graph, "buffersink", "out") ) == NULL )
         goto fail;
 
     if ( av_opt_set(buffersink_ctx, "pixel_formats", av_get_pix_fmt_name( dec_ctx->pix_fmt ), AV_OPT_SEARCH_CHILDREN) < 0 )
@@ -2277,9 +2294,6 @@ fail:
     if ( outputs )
         avfilter_inout_free( &outputs );
     return 1;
-#else
-    return 1;
-#endif
 }
 
 uns8b trp_av_set_gamma( trp_obj_t *fmtctx, trp_obj_t *gamma )
@@ -2389,12 +2403,166 @@ uns8b trp_av_set_vflip( trp_obj_t *fmtctx, trp_obj_t *vflip )
  *************************************************************************************
  */
 
+static int trp_audio_set_parameters( trp_avcodec_audio_t *av,
+                                     AVChannelLayout *in_ch_layout,
+                                     enum AVSampleFormat in_sample_format,
+                                     int in_sample_rate,
+                                     AVChannelLayout *out_ch_layout,
+                                     enum AVSampleFormat out_sample_format,
+                                     int out_sample_rate,
+                                     trp_obj_t *tempo,
+                                     trp_obj_t *pitch )
+{
+    if ( in_ch_layout )
+        memcpy( &av->in_ch_layout, in_ch_layout, sizeof( AVChannelLayout ) );
+    if ( in_sample_format != AV_SAMPLE_FMT_NONE )
+        av->in_sample_format = in_sample_format;
+    if ( in_sample_rate )
+        av->in_sample_rate = in_sample_rate;
+    if ( out_ch_layout )
+        memcpy( &av->out_ch_layout, out_ch_layout, sizeof( AVChannelLayout ) );
+    if ( out_sample_format != AV_SAMPLE_FMT_NONE )
+        av->out_sample_format = out_sample_format;
+    if ( out_sample_rate )
+        av->out_sample_rate = out_sample_rate;
+    if ( tempo )
+        av->tempo = tempo;
+    if ( pitch )
+        av->pitch = pitch;
+    return trp_av_audio_init_filter_graph( av );
+}
+
+static int trp_av_audio_init_filter_graph( trp_avcodec_audio_t *av )
+{
+    AVFilterGraph *graph;
+    AVFilterContext *in_ctx, *out_ctx;
+    AVFilterContext *tempo_ctx, *aformat_ctx;
+    uns8b options_str[ 1024 ], ch_layout[ 64 ];
+    int err;
+
+    graph = avfilter_graph_alloc();
+    if ( graph == NULL )
+        return AVERROR(ENOMEM);
+
+    in_ctx = trp_avfilter_graph_alloc_filter( graph, "abuffer", "in" );
+    if ( in_ctx == NULL ) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    av_channel_layout_describe( &av->in_ch_layout, ch_layout, sizeof( ch_layout ) );
+    av_opt_set    ( in_ctx, "channel_layout", ch_layout,                                      AV_OPT_SEARCH_CHILDREN );
+    av_opt_set    ( in_ctx, "sample_fmt",     av_get_sample_fmt_name( av->in_sample_format ), AV_OPT_SEARCH_CHILDREN );
+    av_opt_set_q  ( in_ctx, "time_base",      (AVRational){ 1, av->in_sample_rate },          AV_OPT_SEARCH_CHILDREN );
+    av_opt_set_int( in_ctx, "sample_rate",    av->in_sample_rate,                             AV_OPT_SEARCH_CHILDREN );
+    err = avfilter_init_str( in_ctx, NULL );
+    if ( err < 0 )
+        goto fail;
+
+    if ( ( av->tempo != UNO ) || ( av->pitch != UNO ) ) {
+        tempo_ctx = trp_avfilter_graph_alloc_filter( graph, ( av->pitch != UNO ) ? "rubberband" : "atempo", "tempo" );
+        if ( tempo_ctx == NULL ) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
+        if ( av->tempo != UNO ) {
+            flt64b d;
+
+            trp_cast_flt64b( av->tempo, &d );
+            av_opt_set_q( tempo_ctx, "tempo", av_d2q( d, INT_MAX ), AV_OPT_SEARCH_CHILDREN );
+        }
+        if ( av->pitch != UNO ) {
+            flt64b d;
+
+            trp_cast_flt64b( av->pitch, &d );
+            av_opt_set_q( tempo_ctx, "pitch", av_d2q( d, INT_MAX ), AV_OPT_SEARCH_CHILDREN );
+        }
+        err = avfilter_init_str( tempo_ctx, NULL );
+        if ( err < 0 )
+            goto fail;
+    } else
+        tempo_ctx = NULL;
+
+    /*
+    aformat_ctx = trp_avfilter_graph_alloc_filter( graph, "aformat", "aformat" );
+    if ( aformat_ctx == NULL ) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    av_channel_layout_describe( &av->out_ch_layout, ch_layout, sizeof( ch_layout ) );
+    snprintf( options_str, sizeof( options_str ),
+              "sample_fmts=%s:sample_rates=%d:channel_layouts=%s",
+              av_get_sample_fmt_name( av->out_sample_format ), av->out_sample_rate, ch_layout );
+    err = avfilter_init_str( aformat_ctx, options_str );
+    if ( err < 0 )
+        goto fail;
+    */
+
+    aformat_ctx = trp_avfilter_graph_alloc_filter( graph, "aresample", "aresample" );
+    if ( aformat_ctx == NULL ) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    av_channel_layout_describe( &av->out_ch_layout, ch_layout, sizeof( ch_layout ) );
+    snprintf( options_str, sizeof( options_str ),
+              "osf=%s:osr=%d:ochl=%s",
+              av_get_sample_fmt_name( av->out_sample_format ), av->out_sample_rate, ch_layout );
+    err = avfilter_init_str( aformat_ctx, options_str );
+    if ( err < 0 )
+        goto fail;
+
+    out_ctx = trp_avfilter_graph_alloc_filter( graph, "abuffersink", "out" );
+    if ( out_ctx == NULL ) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    err = avfilter_init_str( out_ctx, NULL );
+    if ( err < 0 )
+        goto fail;
+
+    if ( tempo_ctx ) {
+        err = avfilter_link( in_ctx, 0, tempo_ctx, 0 );
+        if ( err < 0 )
+            goto fail;
+        err = avfilter_link( tempo_ctx, 0, aformat_ctx, 0 );
+    } else {
+        err = avfilter_link( in_ctx, 0, aformat_ctx, 0 );
+    }
+    if ( err < 0 )
+        goto fail;
+    err = avfilter_link( aformat_ctx, 0, out_ctx, 0 );
+    if ( err < 0 )
+        goto fail;
+    err = avfilter_graph_config( graph, NULL );
+    if ( err < 0 )
+        goto fail;
+
+    if ( av->graph )
+        avfilter_graph_free( &av->graph );
+    av->graph = graph;
+    av->in = in_ctx;
+    av->out = out_ctx;
+    return 0;
+
+fail:
+    avfilter_graph_free( &graph );
+    return err;
+}
+
+/*************************************************************************************
+ *                                                                                   *
+ *                                                                                   *
+ *                                                                                   *
+ *                                                                                   *
+ *                                                                                   *
+ *************************************************************************************
+ */
+
 static uns8b trp_av_read_frame_no_seek_audio( trp_avcodec_audio_t *fmtctx )
 {
     AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( fmtctx );
     AVCodecContext *avctx = fmtctx->avctx;
     AVPacket *packet = fmtctx->packet;
-    AVFrame *frame = fmtctx->frame;
+    AVFrame *frame = fmtctx->in_frame;
     sig64b pkt_dts = AV_NOPTS_VALUE;
     int must_read = 0, res;
 
@@ -2431,6 +2599,19 @@ static uns8b trp_av_read_frame_no_seek_audio( trp_avcodec_audio_t *fmtctx )
             fmtctx->last_error_fun = "avcodec_receive_frame";
             goto error;
         }
+        if ( memcmp( &avctx->ch_layout, &fmtctx->in_ch_layout, sizeof( AVChannelLayout ) ) ||
+             ( avctx->sample_fmt != fmtctx->in_sample_format ) ||
+             ( avctx->sample_rate != fmtctx->in_sample_rate ) ) {
+            /*
+            must_read = 0;
+            continue;
+            */
+            fprintf( stderr, "rilevata modifica dei parametri dell'audio\n" );
+            (void)trp_audio_set_parameters( fmtctx,
+                                            &avctx->ch_layout, avctx->sample_fmt, avctx->sample_rate,
+                                            NULL, AV_SAMPLE_FMT_NONE, 0,
+                                            NULL, NULL );
+        }
         break;
     }
     if ( frame->pkt_dts == AV_NOPTS_VALUE )
@@ -2463,9 +2644,9 @@ trp_obj_t *trp_av_avformat_open_input_audio( trp_obj_t *path, trp_obj_t *nth )
     AVCodecParameters *origin_par;
     const AVCodec *codec;
     AVCodecContext *avctx = NULL;
-    SwrContext *swr_ctx = NULL;
     AVPacket *packet = NULL;
-    AVFrame *frame = NULL;
+    AVFrame *in_frame = NULL;
+    AVFrame *out_frame = NULL;
     uns32b n;
     int audio_stream_idx;
     int res;
@@ -2480,18 +2661,16 @@ trp_obj_t *trp_av_avformat_open_input_audio( trp_obj_t *path, trp_obj_t *nth )
     trp_csprint_free( cpath );
     if ( res )
         return UNDEF;
-    res = avformat_find_stream_info( fmt_ctx, NULL );
-    if ( res < 0 )
+    if ( avformat_find_stream_info( fmt_ctx, NULL ) < 0 )
         goto error;
-    for ( res = 0 ; res < fmt_ctx->nb_streams ; res++ )
-        if ( fmt_ctx->streams[ res ]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO ) {
+    for ( audio_stream_idx = 0 ; audio_stream_idx < fmt_ctx->nb_streams ; audio_stream_idx++ )
+        if ( fmt_ctx->streams[ audio_stream_idx ]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO ) {
             if ( n == 0 )
                 break;
             n--;
         }
-    if ( res == fmt_ctx->nb_streams )
+    if ( audio_stream_idx == fmt_ctx->nb_streams )
         goto error;
-    audio_stream_idx = res;
     origin_par = fmt_ctx->streams[ audio_stream_idx ]->codecpar;
     codec = avcodec_find_decoder( origin_par->codec_id );
     if ( codec == NULL )
@@ -2499,27 +2678,19 @@ trp_obj_t *trp_av_avformat_open_input_audio( trp_obj_t *path, trp_obj_t *nth )
     avctx = avcodec_alloc_context3( codec );
     if ( avctx == NULL )
         goto error;
-    res = avcodec_parameters_to_context( avctx, origin_par );
-    if ( res < 0 )
+    if ( avcodec_parameters_to_context( avctx, origin_par ) < 0 )
         goto error;
     avctx->request_sample_fmt = AV_SAMPLE_FMT_S16;
-    res = avcodec_open2( avctx, codec, NULL );
-    if ( res < 0 )
+    if ( avcodec_open2( avctx, codec, NULL ) < 0 )
         goto error;
     packet = av_packet_alloc();
     if ( packet == NULL )
         goto error;
-    frame = av_frame_alloc();
-    if ( frame == NULL )
+    in_frame = av_frame_alloc();
+    if ( in_frame == NULL )
         goto error;
-    res = swr_alloc_set_opts2( &swr_ctx,
-                               &avctx->ch_layout, AV_SAMPLE_FMT_S16, avctx->sample_rate,
-                               &avctx->ch_layout, avctx->sample_fmt, avctx->sample_rate,
-                               0, NULL );
-    if ( res < 0 )
-        goto error;
-    res = swr_init( swr_ctx );
-    if ( res < 0 )
+    out_frame = av_frame_alloc();
+    if ( out_frame == NULL )
         goto error;
     obj = trp_gc_malloc_finalize( sizeof( trp_avcodec_audio_t ), trp_av_finalize );
     obj->tipo = TRP_AVCODEC;
@@ -2527,28 +2698,104 @@ trp_obj_t *trp_av_avformat_open_input_audio( trp_obj_t *path, trp_obj_t *nth )
     obj->fmt_ctx = fmt_ctx;
     obj->path = path;
     obj->avctx = avctx;
-    obj->swr_ctx = swr_ctx;
     obj->packet = packet;
-    obj->frame = frame;
-    obj->buf = NULL;
+    obj->in_frame = in_frame;
+    obj->out_frame = out_frame;
     obj->audio_stream_idx = audio_stream_idx;
     obj->last_error_fun = "";
     obj->last_error = 0;
-    obj->buf_max_nsamples = 0;
     obj->ignore_invalid_data = 0;
     obj->audio_time_base = trp_av_rational( &( fmt_ctx->streams[ audio_stream_idx ]->time_base ) );
+    obj->graph = NULL;
+    obj->in = NULL;
+    obj->out = NULL;
+    (void)trp_audio_set_parameters( obj,
+                                    &avctx->ch_layout, avctx->sample_fmt, avctx->sample_rate,
+                                    &avctx->ch_layout, AV_SAMPLE_FMT_S16, avctx->sample_rate,
+                                    UNO, UNO );
     return (trp_obj_t *)obj;
 error:
     avformat_close_input( &fmt_ctx );
     if ( avctx )
         avcodec_free_context( &avctx );
-    if ( swr_ctx )
-        swr_free( &swr_ctx );
     if ( packet )
         av_packet_free( &packet );
-    if ( frame )
-        av_frame_free( &frame );
+    if ( in_frame )
+        av_frame_free( &in_frame );
+    if ( out_frame )
+        av_frame_free( &out_frame );
     return UNDEF;
+}
+
+uns8b trp_av_audio_set_output( trp_obj_t *fmtctx, trp_obj_t *channels, trp_obj_t *bps, trp_obj_t *sample_rate, trp_obj_t *tempo, trp_obj_t *pitch )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+    AVChannelLayout ch_layout, *out_ch_layout;
+    enum AVSampleFormat out_sample_format;
+    uns32b out_sample_rate;
+
+    if ( fmt_ctx == NULL )
+        return 1;
+    if ( channels != UNDEF ) {
+        uns32b n;
+
+        if ( trp_cast_uns32b_range( channels, &n, 1, 6 ) )
+            return 1;
+        switch ( n ) {
+            case 1:
+                memcpy( &ch_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_MONO, sizeof( AVChannelLayout ) );
+                break;
+            case 2:
+                memcpy( &ch_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO, sizeof( AVChannelLayout ) );
+                break;
+            case 3:
+                memcpy( &ch_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_SURROUND, sizeof( AVChannelLayout ) );
+                break;
+            case 4:
+                memcpy( &ch_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_4POINT0, sizeof( AVChannelLayout ) );
+                break;
+            case 5:
+                memcpy( &ch_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0, sizeof( AVChannelLayout ) );
+                break;
+            case 6:
+                memcpy( &ch_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1, sizeof( AVChannelLayout ) );
+                break;
+            default:
+                return 1;
+        }
+        out_ch_layout = &ch_layout;
+    } else
+        out_ch_layout = NULL;
+    if ( bps != UNDEF ) {
+        uns32b n;
+
+        if ( trp_cast_uns32b_range( bps, &n, 8, 32 ) )
+            return 1;
+        switch ( n ) {
+            case 8:
+                out_sample_format = AV_SAMPLE_FMT_U8;
+                break;
+            case 16:
+                out_sample_format = AV_SAMPLE_FMT_S16;
+                break;
+            case 32:
+                out_sample_format = AV_SAMPLE_FMT_S32;
+                break;
+            default:
+                return 1;
+        }
+    } else
+        out_sample_format = AV_SAMPLE_FMT_NONE;
+    if ( sample_rate != UNDEF ) {
+        if ( trp_cast_uns32b( sample_rate, &out_sample_rate ) )
+            return 1;
+    } else
+        out_sample_rate = 0;
+    return trp_audio_set_parameters( (trp_avcodec_audio_t *)fmtctx,
+                                     NULL, AV_SAMPLE_FMT_NONE, 0,
+                                     out_ch_layout, out_sample_format, (int)out_sample_rate,
+                                     ( tempo != UNDEF ) ? tempo : NULL,
+                                     ( pitch != UNDEF ) ? pitch : NULL ) ? 1 : 0;
 }
 
 /*************************************************************************************
@@ -2571,50 +2818,31 @@ trp_obj_t *trp_av_audio_read_frame( trp_obj_t *fmtctx )
 
     if ( fmt_ctx == NULL )
         return UNDEF;
-    if ( trp_av_read_frame_no_seek_audio( av ) ) {
-        if ( ( av->last_error != AVERROR_EOF ) || ( av->buf == NULL ) )
+    for ( ; ; ) {
+        res = av_buffersink_get_frame( av->out, av->out_frame );
+        if ( res >= 0 )
+            break;
+        if ( res != AVERROR(EAGAIN) ) {
+            av->last_error_fun = "av_buffersink_get_frame";
+            av->last_error = res;
             return UNDEF;
-        /*
-         * dovrebbe servire per un eventuale flush
-         */
-        res = swr_convert( av->swr_ctx, av->buf, av->buf_max_nsamples, NULL, 0 );
-        if ( res <= 0 )
-            return UNDEF;
-    } else {
-        int nsamples = swr_get_out_samples( av->swr_ctx, av->frame->nb_samples );
-
-        if ( nsamples > av->buf_max_nsamples ) {
-            int i = 0;
-
-            if ( av->buf ) {
-                av_freep( &av->buf[ 0 ] );
-                av_freep( &av->buf );
-            }
-            res = av_samples_alloc_array_and_samples( &av->buf, &i,
-                                                      av->avctx->ch_layout.nb_channels,
-                                                      nsamples,
-                                                      AV_SAMPLE_FMT_S16,
-                                                      0 );
-            if ( res < 0 ) {
-                av->buf_max_nsamples = 0;
-                av->last_error_fun = "av_samples_alloc_array_and_samples";
-                av->last_error = res;
-                return UNDEF;
-            }
-            av->buf_max_nsamples = nsamples;
         }
-        res = swr_convert( av->swr_ctx,
-                           av->buf, av->buf_max_nsamples,
-                           (uns8b **)av->frame->extended_data, av->frame->nb_samples );
-        if ( res <= 0 ) {
-            av->last_error_fun = "swr_convert";
+        if ( trp_av_read_frame_no_seek_audio( av ) ) {
+            res = av_buffersrc_write_frame( av->in, NULL );
+        } else {
+            res = av_buffersrc_write_frame( av->in, av->in_frame );
+        }
+        if ( res < 0 ) {
+            av_frame_unref( av->in_frame );
+            av->last_error_fun = "av_buffersrc_write_frame";
             av->last_error = res;
             return UNDEF;
         }
     }
-    raw_size = 2 * res * av->avctx->ch_layout.nb_channels;
+    raw_size = av_get_bytes_per_sample( av->out_frame->format ) * av->out_frame->nb_samples * av->out_frame->ch_layout.nb_channels;
     raw = trp_raw_internal( raw_size, 0 );
-    memcpy( ((trp_raw_t *)raw)->data, av->buf[ 0 ], raw_size );
+    memcpy( ((trp_raw_t *)raw)->data, av->out_frame->extended_data[ 0 ], raw_size );
+    av_frame_unref( av->out_frame );
     return raw;
 }
 
@@ -2654,7 +2882,7 @@ trp_obj_t *trp_av_audio_seek_and_read_frame( trp_obj_t *fmtctx, trp_obj_t *ts )
         raw = trp_av_audio_read_frame( fmtctx );
         if ( raw == UNDEF )
             break;
-        if ( trp_av_greater_or_equal( trp_av_pts( av, av->frame ), ts ) )
+        if ( trp_av_greater_or_equal( trp_av_pts( av, av->in_frame ), ts ) )
             break;
         trp_close( raw );
     }
@@ -2685,7 +2913,18 @@ trp_obj_t *trp_av_audio_sample_rate( trp_obj_t *fmtctx )
 
     if ( fmt_ctx == NULL )
         return UNDEF;
-    return trp_sig64( ((trp_avcodec_audio_t *)fmtctx)->avctx->sample_rate );
+    return trp_sig64( ((trp_avcodec_audio_t *)fmtctx)->in_sample_rate );
+}
+
+trp_obj_t *trp_av_audio_channels_layout( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+    uns8b ch_layout[ 64 ];
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    av_channel_layout_describe( &( ((trp_avcodec_audio_t *)fmtctx)->in_ch_layout ), ch_layout, sizeof( ch_layout ) );
+    return trp_cord( ch_layout );
 }
 
 trp_obj_t *trp_av_audio_channels( trp_obj_t *fmtctx )
@@ -2694,7 +2933,77 @@ trp_obj_t *trp_av_audio_channels( trp_obj_t *fmtctx )
 
     if ( fmt_ctx == NULL )
         return UNDEF;
-    return trp_sig64( ((trp_avcodec_audio_t *)fmtctx)->avctx->ch_layout.nb_channels );
+    return trp_sig64( ((trp_avcodec_audio_t *)fmtctx)->in_ch_layout.nb_channels );
+}
+
+trp_obj_t *trp_av_audio_out_sample_rate( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    return trp_sig64( ((trp_avcodec_audio_t *)fmtctx)->out_sample_rate );
+}
+
+trp_obj_t *trp_av_audio_out_channels_layout( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+    uns8b ch_layout[ 64 ];
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    av_channel_layout_describe( &( ((trp_avcodec_audio_t *)fmtctx)->out_ch_layout ), ch_layout, sizeof( ch_layout ) );
+    return trp_cord( ch_layout );
+}
+
+trp_obj_t *trp_av_audio_out_channels( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    return trp_sig64( ((trp_avcodec_audio_t *)fmtctx)->out_ch_layout.nb_channels );
+}
+
+trp_obj_t *trp_av_audio_out_bps( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+    int bps;
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    switch ( ((trp_avcodec_audio_t *)fmtctx)->out_sample_format ) {
+        case AV_SAMPLE_FMT_U8:
+            bps = 8;
+            break;
+        case AV_SAMPLE_FMT_S16:
+            bps = 16;
+            break;
+        case AV_SAMPLE_FMT_S32:
+            bps = 32;
+            break;
+        default:
+            return UNDEF;
+    }
+    return trp_sig64( bps );
+}
+
+trp_obj_t *trp_av_audio_tempo( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    return ((trp_avcodec_audio_t *)fmtctx)->tempo;
+}
+
+trp_obj_t *trp_av_audio_pitch( trp_obj_t *fmtctx )
+{
+    AVFormatContext *fmt_ctx = trp_av_extract_fmt_context_audio( (trp_avcodec_audio_t *)fmtctx );
+
+    if ( fmt_ctx == NULL )
+        return UNDEF;
+    return ((trp_avcodec_audio_t *)fmtctx)->pitch;
 }
 
 trp_obj_t *trp_av_audio_ts( trp_obj_t *fmtctx )
@@ -2703,7 +3012,7 @@ trp_obj_t *trp_av_audio_ts( trp_obj_t *fmtctx )
 
     if ( fmt_ctx == NULL )
         return UNDEF;
-    return trp_av_pts( (trp_avcodec_t *)fmtctx, ((trp_avcodec_audio_t *)fmtctx)->frame );
+    return trp_av_pts( (trp_avcodec_t *)fmtctx, ((trp_avcodec_audio_t *)fmtctx)->in_frame );
 }
 
 /*************************************************************************************
